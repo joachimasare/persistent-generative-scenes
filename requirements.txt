@@ -3,7 +3,6 @@ torchvision
 diffusers
 accelerate
 open3d
-instant-ngp
 numpy
 matplotlib
 scikit-image
