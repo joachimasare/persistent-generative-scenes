@@ -1,98 +1,105 @@
 import numpy as np
+from tqdm import tqdm
 
 class VoxelMemory:
-    def __init__(self, dims=(32, 32, 32), voxel_size=1.0):
-        """
-        dims: tuple of ints (Nx, Ny, Nz), number of voxels along each axis
-        voxel_size: float, world-unit length per voxel
-        """
-        self.dims = np.array(dims, dtype=int)
-        self.voxel_size = float(voxel_size)
-        # Accumulate color sums and sample counts per voxel
-        self.color_accum = np.zeros((*self.dims, 3), dtype=np.float32)
-        self.counts = np.zeros(self.dims, dtype=np.int32)
-
-    def world_to_grid(self, pts_world):
-        """
-        Convert world coordinates to voxel indices.
-        pts_world: (N,3) array of points in world space.
-        Returns: (N,3) integer indices clipped to [0, dims-1].
-        """
-        idx = np.floor(pts_world / self.voxel_size).astype(int)
-        idx = np.clip(idx, [0,0,0], self.dims - 1)
-        return idx
+    def __init__(self, dims=(128,128,128), voxel_size=0.25):
+        self.dims        = np.array(dims, dtype=int)
+        self.voxel_size  = float(voxel_size)
+        self.color_accum = np.zeros((*self.dims,3), dtype=np.float32)
+        self.counts      = np.zeros(self.dims,   dtype=np.int32)
 
     def update(self, pose, rgb, depth, intrinsic):
         """
-        Integrate a new RGB-D view into memory.
-        pose: (4,4) camera-to-world transform matrix
-        rgb: (H,W,3) uint8 image array
-        depth: (H,W) float or int, depth in the same scale as intrinsic (meters)
-        intrinsic: object with fx, fy, cx, cy attributes
+        Fuse a real RGB‐D observation into the memory.
         """
-        H, W = depth.shape
-        # Flatten pixel grid
-        u, v = np.meshgrid(np.arange(W), np.arange(H), indexing='xy')  # u: x, v: y
-        z = depth.astype(np.float32)
-        # Backproject to camera coords
-        x = (u - intrinsic.cx) * z / intrinsic.fx
-        y = (v - intrinsic.cy) * z / intrinsic.fy
-        pts_cam = np.stack([x, y, z], axis=-1).reshape(-1, 3)  # (H*W, 3)
-        # Transform to world
-        R = pose[:3, :3]
-        t = pose[:3, 3]
-        pts_world = (R @ pts_cam.T).T + t  # (H*W, 3)
-        # Map to voxel grid
-        vox_idx = self.world_to_grid(pts_world)  # (H*W, 3)
-        flat_idx = (vox_idx[:,0] * self.dims[1] * self.dims[2]
-                    + vox_idx[:,1] * self.dims[2]
-                    + vox_idx[:,2])
-        # Normalize color to [0,1]
-        colors = rgb.reshape(-1, 3).astype(np.float32) / 255.0
-        # Accumulate color sums and counts
-        flat_accum = self.color_accum.reshape(-1, 3)
-        flat_counts = self.counts.reshape(-1)
-        np.add.at(flat_accum, flat_idx, colors)
-        np.add.at(flat_counts, flat_idx, 1)
-        # Reshape back
-        self.color_accum = flat_accum.reshape(*self.dims, 3)
-        self.counts = flat_counts.reshape(*self.dims)
+        self._fuse(pose, rgb, depth, intrinsic)
 
-    def query(self, pose, intrinsic, view_size=(256, 256)):
+    def apply_rgbd(self, pose, rgb, depth, intrinsic):
         """
-        Project stored voxel centers into the camera to produce a depth hint map.
-        pose: (4,4) camera-to-world transform
-        intrinsic: object with fx, fy, cx, cy attributes
-        view_size: (H, W) output hint map size
-        Returns: depth_hint (H,W) float32, zeros where unknown
+        Alias for update(), but semantically for hallucinated frames.
+        """
+        self._fuse(pose, rgb, depth, intrinsic)
+
+    def _fuse(self, pose, rgb, depth, intrinsic):
+        H, W = depth.shape
+        u,v = np.meshgrid(np.arange(W), np.arange(H), indexing='xy')
+        z   = depth.astype(np.float32)
+
+        valid = (z>0) & np.isfinite(z)
+        if not np.any(valid):
+            return
+
+        # flatten & mask
+        idx_flat = valid.reshape(-1)
+        u_f = u.reshape(-1)[idx_flat]
+        v_f = v.reshape(-1)[idx_flat]
+        z_f = z.reshape(-1)[idx_flat]
+        cols = rgb.reshape(-1,3)[idx_flat].astype(np.float32)/255.0
+
+        # backproject to camera space
+        x = (u_f - intrinsic.cx) * z_f / intrinsic.fx
+        y = (v_f - intrinsic.cy) * z_f / intrinsic.fy
+        pts_cam = np.stack([x, y, z_f], axis=-1)
+
+        # transform to world
+        R, t = pose[:3,:3], pose[:3,3]
+        pts_w = (R @ pts_cam.T).T + t
+
+        # keep inside volume
+        mins, maxs = np.zeros(3), self.dims * self.voxel_size
+        inb = np.all((pts_w >= mins) & (pts_w < maxs), axis=1)
+        if not np.any(inb):
+            return
+        pts_w, cols = pts_w[inb], cols[inb]
+
+        # voxel indices
+        vox  = np.floor(pts_w / self.voxel_size).astype(int)
+        flat = vox[:,0]*self.dims[1]*self.dims[2] + vox[:,1]*self.dims[2] + vox[:,2]
+
+        # accumulate
+        acc = self.color_accum.reshape(-1,3)
+        cnt = self.counts.reshape(-1)
+        np.add.at(acc, flat, cols)
+        np.add.at(cnt, flat, 1)
+        self.color_accum = acc.reshape(*self.dims,3)
+        self.counts      = cnt.reshape(*self.dims)
+
+    def query(self, pose, intrinsic, view_size=(256,256), max_dist=50.0):
+        """
+        Ray-march each pixel’s ray through the grid, returning a depth-hint H×W.
+        Always returns an array, even if empty.
         """
         H, W = view_size
-        # Compute voxel center coordinates in world
-        grid_idxs = np.indices(self.dims).reshape(3, -1).T  # (Nx*Ny*Nz, 3)
-        centers = (grid_idxs + 0.5) * self.voxel_size  # center of each voxel
-        # Filter only voxels with data
-        counts_flat = self.counts.reshape(-1)
-        valid = counts_flat > 0
-        if not np.any(valid):
-            return np.zeros((H, W), dtype=np.float32)
-        valid_centers = centers[valid]
-        # Transform to camera coords
-        R = pose[:3, :3]
-        t = pose[:3, 3]
-        pts_cam = (R.T @ (valid_centers - t).T).T  # world->camera: invert transform
-        # Project to pixel coords
-        x = pts_cam[:, 0]
-        y = pts_cam[:, 1]
-        z = pts_cam[:, 2]
-        u = (x * intrinsic.fx / z) + intrinsic.cx
-        v = (y * intrinsic.fy / z) + intrinsic.cy
-        u = np.round(u).astype(int)
-        v = np.round(v).astype(int)
-        # Initialize depth hint map
         depth_hint = np.zeros((H, W), dtype=np.float32)
-        # Keep smallest z per pixel
-        for ui, vi, zi in zip(u, v, z):
-            if 0 <= ui < W and 0 <= vi < H:
-                if depth_hint[vi, ui] == 0 or zi < depth_hint[vi, ui]:
-                    depth_hint[vi, ui] = zi
+
+        # pixel→camera rays
+        u, v = np.meshgrid(np.arange(W), np.arange(H), indexing='xy')
+        dirs_cam = np.stack([
+            (u - intrinsic.cx) / intrinsic.fx,
+            (v - intrinsic.cy) / intrinsic.fy,
+            np.ones_like(u)
+        ], axis=-1).reshape(-1,3).astype(np.float32)
+
+        # world‐space origins & directions
+        R, t = pose[:3,:3], pose[:3,3]
+        rays_o = np.tile(t, (W*H,1))
+        rays_d = (R @ dirs_cam.T).T
+        rays_d /= np.linalg.norm(rays_d, axis=1, keepdims=True)
+
+        step    = self.voxel_size * 0.8
+        n_steps = int(np.ceil(max_dist / step))
+
+        for idx in tqdm(range(W*H), desc="Phase 3 ray‐march"):
+            origin    = rays_o[idx]
+            direction = rays_d[idx]
+            for si in range(n_steps):
+                p = origin + direction * (si * step)
+                vi = (p / self.voxel_size).astype(int)
+                if np.any(vi < 0) or np.any(vi >= self.dims):
+                    break
+                if self.counts[vi[0],vi[1],vi[2]] > 0:
+                    y, x = divmod(idx, W)
+                    depth_hint[y, x] = np.linalg.norm(p - t)
+                    break
+
         return depth_hint
