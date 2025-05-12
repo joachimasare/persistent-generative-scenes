@@ -1,10 +1,14 @@
 torch
 torchvision
 diffusers
+transformers
 accelerate
+safetensors
+huggingface-hub
 open3d
 numpy
 matplotlib
 scikit-image
 wandb
 omegaconf
+Pillow
